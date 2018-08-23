@@ -13,6 +13,7 @@ find_package(catkin
     roscpp
     message_generation
     roboteq_msgs
+    xacro
 )
 
 
@@ -93,6 +94,11 @@ add_dependencies(navigator_thrusters
 catkin_package(
     INCLUDE_DIRS include
     CATKIN_DEPENDS gazebo_ros roscpp rospy std_msgs nav_msgs message_runtime tf gazebo_plugins sensor_msgs
+)
+
+xacro_add_files(
+  urdf/navigator.urdf.xacro
+  INORDER INSTALL DESTINATION urdf
 )
 
 # if(CATKIN_ENABLE_TESTING)
