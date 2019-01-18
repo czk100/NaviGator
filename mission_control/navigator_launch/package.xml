@@ -48,6 +48,15 @@
   <run_depend>usb_cam</run_depend>
   <run_depend>navigator_missions</run_depend>
   <run_depend>navigator_2dsim</run_depend>
+  <run_depend>robot_state_publisher</run_depend>
+  <run_depend>joint_state_publisher</run_depend>
+  <run_depend>mil_passive_sonar</run_depend>
+  <run_depend>mil_pneumatic_actuator</run_depend>
+  <run_depend>mil_bounds</run_depend>
+  <run_depend>sabertooth2x12</run_depend>
+  <run_depend>point_cloud_object_detection_and_recognition</run_depend>
+  <run_depend>navigator_robotx_comms</run_depend>
+  <run_depend>mil_poi</run_depend>
   <export>
   </export>
 </package>

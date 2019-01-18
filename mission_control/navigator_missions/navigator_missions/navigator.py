@@ -15,10 +15,16 @@ from nav_msgs.msg import Odometry
 from std_srvs.srv import SetBool, SetBoolRequest
 from geometry_msgs.msg import PoseStamped, PointStamped
 import navigator_msgs.srv as navigator_srvs
+from mil_msgs.srv import ObjectDBQuery, ObjectDBQueryRequest
 from topic_tools.srv import MuxSelect, MuxSelectRequest
 from mil_misc_tools.text_effects import fprint
 from navigator_tools import MissingPerceptionObject
 from mil_tasks_core import BaseTask
+from mil_passive_sonar import TxHydrophonesClient
+from mil_pneumatic_actuator.srv import SetValve, SetValveRequest
+from mil_poi import TxPOIClient
+from roboteq_msgs.msg import Command
+from std_msgs.msg import Bool
 
 
 class MissionResult(object):
@@ -56,6 +62,9 @@ class Navigator(BaseTask):
     red = "RED"
     green = "GREEN"
     blue = "BLUE"
+    net_stc_results = None
+    net_entrance_results = None
+    max_grinch_effort = 500
 
     def __init__(self, **kwargs):
         super(Navigator, self).__init__(**kwargs)
@@ -67,14 +76,15 @@ class Navigator(BaseTask):
         cls.vision_proxies = {}
         cls._load_vision_services()
 
+        cls.launcher_state = "inactive"
+        cls._actuator_timing = yield cls.nh.get_param("~actuator_timing")
+
         cls.mission_params = {}
         cls._load_mission_params()
 
         # If you don't want to use txros
         cls.pose = None
         cls.ecef_pose = None
-
-        cls.enu_bounds = None
 
         cls.killed = '?'
         cls.odom_loss = '?'
@@ -98,8 +108,20 @@ class Navigator(BaseTask):
             return setattr(cls, 'ecef_pose', mil_tools.odometry_to_numpy(odom)[0])
         cls._ecef_odom_sub = cls.nh.subscribe('absodom', Odometry, enu_odom_set)
 
+        cls.hydrophones = TxHydrophonesClient(cls.nh)
+
+        cls.poi = TxPOIClient(cls.nh)
+
+        cls._grinch_lower_time = yield cls.nh.get_param("~grinch_lower_time")
+        cls._grinch_raise_time = yield cls.nh.get_param("~grinch_raise_time")
+        cls.grinch_limit_switch_pressed = False
+        cls._grinch_limit_switch_sub = yield cls.nh.subscribe('/limit_switch', Bool, cls._grinch_limit_switch_cb)
+        cls._winch_motor_pub = cls.nh.advertise("/grinch_winch/cmd", Command)
+        cls._grind_motor_pub = cls.nh.advertise("/grinch_spin/cmd", Command)
+
         try:
-            cls._database_query = cls.nh.get_service_client('/database/requests', navigator_srvs.ObjectDBQuery)
+            cls._actuator_client = cls.nh.get_service_client('/actuator_driver/actuate', SetValve)
+            cls._database_query = cls.nh.get_service_client('/database/requests', ObjectDBQuery)
             cls._camera_database_query = cls.nh.get_service_client(
                 '/camera_database/requests', navigator_srvs.CameraDBQuery)
             cls._change_wrench = cls.nh.get_service_client('/wrench/select', MuxSelect)
@@ -109,6 +131,10 @@ class Navigator(BaseTask):
                 err), title="NAVIGATOR", msg_color='red')
 
         cls.tf_listener = tf.TransformListener(cls.nh)
+
+        # Vision
+        cls.obstacle_course_vision_enable = cls.nh.get_service_client('/vision/obsc/enable', SetBool)
+        cls.docks_vision_enable = cls.nh.get_service_client('/vision/docks/enable', SetBool)
 
         yield cls._make_alarms()
 
@@ -124,8 +150,13 @@ class Navigator(BaseTask):
             fprint("Waiting for odom...", title="NAVIGATOR")
             odom = util.wrap_time_notice(cls._odom_sub.get_next_message(), 2, "Odom listener")
             enu_odom = util.wrap_time_notice(cls._ecef_odom_sub.get_next_message(), 2, "ENU Odom listener")
-            # bounds = util.wrap_time_notice(cls._make_bounds(), 2, "Bounds creation")
             yield defer.gatherResults([odom, enu_odom])  # Wait for all those to finish
+
+        cls.docking_scan = 'NA'
+
+    @classmethod
+    def _grinch_limit_switch_cb(cls, data):
+        cls.grinch_limit_switch_pressed = data.data
 
     @property
     @util.cancellableInlineCallbacks
@@ -151,33 +182,207 @@ class Navigator(BaseTask):
         # For a unified result class
         return MissionResult(*args, **kwargs)
 
-    @classmethod
     @util.cancellableInlineCallbacks
-    def _make_bounds(cls):
-        fprint("Constructing bounds.", title="NAVIGATOR")
+    def set_vision_dock(self):
+        yield self.obstacle_course_vision_enable(SetBoolRequest(data=False))
+        yield self.docks_vision_enable(SetBoolRequest(data=True))
 
-        if (yield cls.nh.has_param("/bounds/enforce")):
-            _bounds = cls.nh.get_service_client('/get_bounds', navigator_srvs.Bounds)
-            yield _bounds.wait_for_service()
-            resp = yield _bounds(navigator_srvs.BoundsRequest())
-            if resp.enforce:
-                cls.enu_bounds = [mil_tools.rosmsg_to_numpy(bound) for bound in resp.bounds]
-        else:
-            fprint("No bounds param found, defaulting to none.", title="NAVIGATOR")
-            cls.enu_bounds = None
+    @util.cancellableInlineCallbacks
+    def set_vision_obstacle_course(self):
+        yield self.docks_vision_enable(SetBoolRequest(data=False))
+        yield self.obstacle_course_vision_enable(SetBoolRequest(data=True))
+
+    @util.cancellableInlineCallbacks
+    def set_vision_off(self):
+        yield self.obstacle_course_vision_enable(SetBoolRequest(data=False))
+        yield self.docks_vision_enable(SetBoolRequest(data=False))
+
+    @util.cancellableInlineCallbacks
+    def spin_grinch(self, speed=1.0, interval=0.1):
+        '''
+        Spin the grinch mechnaism. To avoid watchdog timeout, this is sent
+        in a loop at the specified interface. So to stop spinning,
+        cancel the defer
+
+        Example:
+        # start spinning
+        d = self.spin_grinch()
+        # do some stuf....
+        ...
+        # Stop spinning
+        d.cancel()
+        '''
+        while True:
+            self._grind_motor_pub.publish(Command(setpoint=speed * self.max_grinch_effort))
+            yield self.nh.sleep(interval)
+
+    @util.cancellableInlineCallbacks
+    def spin_winch(self, speed=-1.0, interval=0.1):
+        '''
+        Spin the grinch raise/lower mechanism. To avoid watchdog timeout, this is sent
+        in a loop at the specified interface. So to stop spinning,
+        cancel the defer
+        '''
+        while True:
+            self._winch_motor_pub.publish(Command(setpoint=speed * self.max_grinch_effort))
+            yield self.nh.sleep(interval)
+
+    @util.cancellableInlineCallbacks
+    def deploy_grinch(self):
+        '''
+        Deploy the grinch mechanism
+        '''
+        winch_defer = self.spin_winch(speed=1.0)
+        yield self.nh.sleep(self._grinch_lower_time)
+        self._winch_motor_pub.publish(Command(setpoint=0))
+        winch_defer.cancel()
+
+    @util.cancellableInlineCallbacks
+    def retract_grinch(self):
+        '''
+        Retract the grinch mechanism
+        '''
+        now = yield self.nh.get_time()
+        end = now + genpy.Duration(self._grinch_raise_time)
+        winch_defer = self.spin_winch(speed=-1.0)
+        while True:
+            now = yield self.nh.get_time()
+            if self.grinch_limit_switch_pressed:
+                print 'limit switch pressed, stopping'
+                break
+            elif now >= end:
+                print 'retract timed out'
+                break
+            yield self.nh.sleep(0.1)
+        winch_defer.cancel()
+        self._winch_motor_pub.publish(Command(setpoint=0))
+
+    @util.cancellableInlineCallbacks
+    def deploy_thruster(self, name):
+        '''
+        Execute sequence to deploy one thruster
+        '''
+        extend = name + '_extend'
+        retract = name + '_retract'
+        unlock = name + '_unlock'
+        # Pull thruster up a bit to remove pressure from lock
+        yield self.set_valve(retract, True)
+        yield self.nh.sleep(self._actuator_timing['deploy_loosen_time'])
+        # Stop pulling thruster up and unlock
+        yield self.set_valve(retract, False)
+        yield self.set_valve(unlock, True)
+        # Beging extending piston to push thruster down
+        yield self.set_valve(extend, True)
+        yield self.nh.sleep(self._actuator_timing['deploy_wait_time'])
+        # Lock and stop extending after waiting a time for lock to engage
+        yield self.set_valve(unlock, False)
+        yield self.nh.sleep(self._actuator_timing['deploy_lock_time'])
+        yield self.set_valve(extend, False)
+
+    @util.cancellableInlineCallbacks
+    def retract_thruster(self, name):
+        '''
+        Execute sequence to retract one thruster
+        '''
+        retract = name + '_retract'
+        unlock = name + '_unlock'
+        # Unlock and begin pulling thruster up
+        yield self.set_valve(unlock, True)
+        yield self.set_valve(retract, True)
+        # Wait time for piston to fully retract
+        yield self.nh.sleep(self._actuator_timing['retract_wait_time'])
+        # Lock thruster in place
+        yield self.set_valve(unlock, False)
+        # Wait some time for lock to engage
+        yield self.nh.sleep(self._actuator_timing['retract_lock_time'])
+        # Stop pulling up
+        yield self.set_valve(retract, False)
+
+    def deploy_thrusters(self):
+        '''
+        Deploy all 4 thrusters simultaneously.
+        TODO: perform in sequence after testing has been done to see if this is needed
+        '''
+        return defer.DeferredList([self.deploy_thruster(name) for name in ['FL', 'FR', 'BL', 'BR']])
+
+    def retract_thrusters(self):
+        '''
+        Retract all 4 thrusters simultaneously.
+        TODO: perform in sequence after testing has been done to see if this is needed
+        '''
+
+        return defer.DeferredList([self.retract_thruster(name) for name in ['FL', 'FR', 'BL', 'BR']])
+
+    @util.cancellableInlineCallbacks
+    def reload_launcher(self):
+        if self.launcher_state != "inactive":
+            raise Exception("Launcher is {}".format(self.launcher_state))
+        self.launcher_state = "reloading"
+        yield self.set_valve('LAUNCHER_RELOAD_EXTEND', True)
+        yield self.set_valve('LAUNCHER_RELOAD_RETRACT', False)
+        yield self.nh.sleep(self._actuator_timing['launcher_reload_extend_time'])
+        yield self.set_valve('LAUNCHER_RELOAD_EXTEND', False)
+        yield self.set_valve('LAUNCHER_RELOAD_RETRACT', True)
+        yield self.nh.sleep(self._actuator_timing['launcher_reload_retract_time'])
+        yield self.set_valve('LAUNCHER_RELOAD_EXTEND', False)
+        yield self.set_valve('LAUNCHER_RELOAD_RETRACT', False)
+        self.launcher_state = "inactive"
+
+    @util.cancellableInlineCallbacks
+    def fire_launcher(self):
+        if self.launcher_state != "inactive":
+            raise Exception("Launcher is {}".format(self.launcher_state))
+        self.launcher_state = "firing"
+        yield self.set_valve('LAUNCHER_FIRE', True)
+        yield self.nh.sleep(0.5)
+        self.launcher_state = "inactive"
+
+    def set_valve(self, name, state):
+        req = SetValveRequest(actuator=name, opened=state)
+        return self._actuator_client(req)
+
+    @util.cancellableInlineCallbacks
+    def get_sorted_objects(self, name, n=-1, throw=True, **kwargs):
+        '''
+        Get the closest N objects with a particular name from the PCODAR database
+        @param name: the name of the object
+        @param n: the number of objects to get, if -1, get all of them
+        @param throw: If true, raise exception if not enough objects present
+        @param **kwargs: other kwargs to give to database_query
+        @return tuple([sorted_object_messages, [object_positions]) of sorted object messages
+                and their positions as a Nx3 numpy array.
+        '''
+        objects = (yield self.database_query(object_name=name, **kwargs)).objects
+        if n != -1 and len(objects) < n:
+            if throw:
+                raise Exception('Could not get {} {} objects'.format(n, name))
+            else:
+                n = len(objects)
+        if n == 0:
+            defer.returnValue(None)
+        positions = np.empty((len(objects), 3))
+        for i, obj in enumerate(objects):
+            positions[i, :] = mil_tools.rosmsg_to_numpy(obj.pose.position)
+        nav_pose = (yield self.tx_pose)[0]
+        distances = np.linalg.norm(positions - nav_pose, axis=1)
+        distances_argsort = np.argsort(distances)
+        if n != -1:
+            distances_argsort = distances_argsort[:n]
+        objects_sorted = [objects[i] for i in distances_argsort]
+        defer.returnValue((objects_sorted, positions[distances_argsort, :]))
 
     @util.cancellableInlineCallbacks
     def database_query(self, object_name=None, raise_exception=True, **kwargs):
         if object_name is not None:
             kwargs['name'] = object_name
-            res = yield self._database_query(navigator_srvs.ObjectDBQueryRequest(**kwargs))
+            res = yield self._database_query(ObjectDBQueryRequest(**kwargs))
 
             if not res.found and raise_exception:
                 raise MissingPerceptionObject(kwargs['name'])
 
             defer.returnValue(res)
 
-        res = yield self._database_query(navigator_srvs.ObjectDBQueryRequest(**kwargs))
+        res = yield self._database_query(ObjectDBQueryRequest(**kwargs))
         defer.returnValue(res)
 
     @util.cancellableInlineCallbacks
@@ -198,6 +403,20 @@ class Navigator(BaseTask):
     @classmethod
     def change_wrench(cls, source):
         return cls._change_wrench(MuxSelectRequest(source))
+
+    @classmethod
+    def disable_thrusters(cls):
+        '''
+        Disable thrusters by setting the wrench source to none
+        '''
+        return cls.change_wrench("__none")
+
+    @classmethod
+    def enable_autonomous(cls):
+        '''
+        Enable autonmous wrench, useful to call after disable_thrusters to regain control
+        '''
+        return cls.change_wrench("autonomous")
 
     @classmethod
     def change_trajectory(cls, source):

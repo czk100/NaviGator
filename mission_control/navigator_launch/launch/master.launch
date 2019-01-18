@@ -1,18 +1,30 @@
 <launch>
     <arg name="simulation" default="False" />
+    <arg name="online-bagger" default="True" />
 
     <!-- Load model into rviz -->
-    <param name="robot_description" command="cat $(find navigator_gazebo)/models/wamv/wamv.xml"/>
+    <include file="$(find navigator_launch)/launch/upload_urdf.launch" />
 
     <!-- All nodes that run on NaviGator -->
-    <include file="$(find navigator_launch)/launch/gnc.launch"/>
+    <include file="$(find navigator_launch)/launch/gnc.launch">
+       <arg name="simulation" value="$(arg simulation)" />
+    </include>
     <include file="$(find navigator_launch)/launch/alarms.launch"/>
     <include file="$(find navigator_launch)/launch/diagnostics.launch" />
-    <include file="$(find navigator_launch)/launch/online_bagger.launch" />
+    <include if="$(arg online-bagger)" file="$(find navigator_launch)/launch/online_bagger.launch" />
     <include file="$(find navigator_missions)/launch/task_runner.launch" />
     <include file="$(find navigator_launch)/launch/hardware.launch">
        <arg name="simulation" value="$(arg simulation)" />
     </include>
-    <!-- Currently Disabled while new perception programs are developed for RobotX 2018 -->
-    <!-- include file="$(find navigator_launch)/launch/perception.launch" /-->
+    <include file="$(find navigator_launch)/launch/robotx_comms.launch"/>
+
+    <!-- Run computer vision / sonar perception nodes -->
+    <include file="$(find navigator_launch)/launch/perception.launch">
+      <arg name="simulation" value="$(arg simulation)" />
+    </include>
+
+    <!-- POI (point of interest) server -->
+    <include file="$(find navigator_launch)/launch/poi.launch">
+      <arg name="simulation" value="$(arg simulation)" />
+    </include>
 </launch>

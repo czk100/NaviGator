@@ -27,6 +27,7 @@ add_message_files(
   Host.msg
   Hosts.msg
   ColoramaDebug.msg
+  ScanTheCode.msg
 )
 
 add_service_files(
@@ -49,6 +50,9 @@ add_service_files(
   FindPinger.srv
   SetFrequency.srv
   GetDockBays.srv
+  MessageDetectDeliver.srv
+  MessageExtranceExitGate.srv
+  MessageIdentifySymbolsDock.srv
 )
 
 add_action_files(
